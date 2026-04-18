@@ -1,4 +1,4 @@
-# Kala Stream Download
+# Kala Stream Downloader
 
 Script en Python para monitorear un canal de Twitch, grabar el directo con `streamlink` y procesar el archivo final con `ffmpeg`.
 
