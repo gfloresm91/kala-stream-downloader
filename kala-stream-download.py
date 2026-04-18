@@ -269,7 +269,7 @@ class TwitchRecorder:
         except Exception as exc:
             logging.warning("No se pudo obtener el último VOD: %s", exc)
 
-        processed_dir, final_name, vod_id = self.build_targets(
+        processed_dir, recorded_name, processed_name, vod_id = self.build_targets(
             live_info=live_info,
             latest_vod=latest_vod,
             fallback_title=stream_title,
@@ -280,18 +280,18 @@ class TwitchRecorder:
 
         processed_dir.mkdir(parents=True, exist_ok=True)
 
-        new_recorded_file = self.make_safe_unique_file(self.recorded_root / final_name)
+        new_recorded_file = self.make_safe_unique_file(self.recorded_root / recorded_name)
         if recorded_file != new_recorded_file:
             recorded_file.rename(new_recorded_file)
             recorded_file = new_recorded_file
 
-        processed_file = self.make_safe_unique_file(processed_dir / final_name)
+        processed_file = self.make_safe_unique_file(processed_dir / processed_name)
 
         if self.cfg.chat_download and vod_id:
-            self.download_chat(vod_id, processed_dir, final_name)
+            self.download_chat(vod_id, processed_dir, processed_name)
 
         if self.cfg.download_vod and vod_id:
-            self.download_vod(vod_id, final_name)
+            self.download_vod(vod_id, processed_name)
 
         logging.info("Reparando video con ffmpeg...")
         self.run_ffmpeg_fix(recorded_file, processed_file)
@@ -305,12 +305,13 @@ class TwitchRecorder:
         fallback_game: str,
         present_date: str,
         present_datetime: str,
-    ) -> tuple[Path, str, Optional[str]]:
+    ) -> tuple[Path, str, str, Optional[str]]:
         vod_id = None
         game_name = sanitize_name(live_info.get("game_name", fallback_game))
         title = fallback_title
         date_prefix = present_date
         datetime_prefix = self.now_local().strftime("%Y%m%d_(%H-%M)")
+        time_suffix = present_datetime.split("_", 1)[1]
 
         if latest_vod:
             vod_id = latest_vod.get("id")
@@ -327,9 +328,18 @@ class TwitchRecorder:
                 f"{datetime_prefix}_{vod_id}_{title}_{game_name}_{self.cfg.username}.mp4"
             )
         else:
-            filename = sanitize_name(
+            recorded_name = sanitize_name(
                 f"{present_datetime}_{title}_{game_name}_{self.cfg.username}.mp4"
             )
+
+        if vod_id:
+            recorded_name = sanitize_name(
+                f"{datetime_prefix}_{vod_id}_{title}_{game_name}_{self.cfg.username}.mp4"
+            )
+
+        processed_name = sanitize_name(
+            f"{present_date}_{fallback_title}_{time_suffix}.mp4"
+        )
 
         if self.cfg.short_folder:
             folder_name = date_prefix
@@ -344,17 +354,17 @@ class TwitchRecorder:
             else self.processed_root
         )
 
-        candidate = processed_dir / filename
+        candidate = processed_dir / processed_name
         candidate = self.ensure_path_length(
             candidate,
-            title,
+            fallback_title,
             game_name,
-            vod_id,
-            date_prefix,
+            None,
+            present_date,
             present_datetime,
         )
 
-        return candidate.parent, candidate.name, vod_id
+        return candidate.parent, recorded_name, candidate.name, vod_id
 
     def run_streamlink_live(self, output_file: Path) -> None:
         cmd = [self.cfg.streamlink_binary]
@@ -511,6 +521,7 @@ class TwitchRecorder:
             return candidate
 
         current_title = title
+        time_suffix = present_datetime.split("_", 1)[1]
 
         for _ in range(12):
             if len(current_title) <= 12:
@@ -524,7 +535,7 @@ class TwitchRecorder:
                 )
             else:
                 filename = sanitize_name(
-                    f"{present_datetime}_{current_title}_{game_name}_{self.cfg.username}.mp4"
+                    f"{date_prefix}_{current_title}_{time_suffix}.mp4"
                 )
 
             if self.cfg.short_folder:

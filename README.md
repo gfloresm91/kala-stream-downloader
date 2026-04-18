@@ -33,6 +33,8 @@ También necesitas tener `streamlink` y `ffmpeg` disponibles en tu `PATH`.
 Crea un archivo `.env` en la raíz del proyecto. Un ejemplo mínimo:
 
 ```env
+TWITCH_USERNAME=tu_canal
+
 TWITCH_CLIENT_ID=tu_client_id
 TWITCH_CLIENT_SECRET=tu_client_secret
 TWITCH_OAUTH_PRIVATE=
@@ -67,7 +69,7 @@ Si quieres, puedes partir desde [.env_example](/Users/gabriel/Developer/kala-dow
 Con el `.env` listo:
 
 ```bash
-python3 kala-stream-download.py --username tu_canal
+python3 kala-stream-download.py
 ```
 
 También puedes pasar opciones por CLI, por ejemplo:
@@ -90,7 +92,17 @@ python3 kala-stream-download.py --username tu_canal --root-path /tmp/twitch-reco
 
 Si `TWITCH_MAKE_STREAM_FOLDER=true`, cada stream se guarda dentro de su propia carpeta en `processed/<canal>/`.
 
+El archivo final procesado se genera con este formato:
+
+```text
+YYYYMMDD_<titulo_stream>_HHhMMmSSs.mp4
+```
+
 ## Variables importantes
+
+`TWITCH_USERNAME`
+
+Canal que el script va a monitorear.
 
 `TWITCH_ROOT_PATH`
 
