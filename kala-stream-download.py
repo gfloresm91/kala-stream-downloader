@@ -9,6 +9,7 @@ import os
 import shutil
 import subprocess
 import sys
+import threading
 import time
 from dataclasses import dataclass
 from datetime import datetime
@@ -36,6 +37,14 @@ class Config:
     timezone_name: str
     chat_download: bool
     download_vod: bool
+    compress_processed_enabled: bool
+    compress_processed_path: Path | None
+    compress_processed_preset_file: Path | None
+    compress_processed_preset_name: str
+    compress_processed_suffix: str
+    archive_processed_enabled: bool
+    archive_processed_path: Path | None
+    archive_processed_mode: str
     make_stream_folder: bool
     short_folder: bool
     hls_segments_live: int
@@ -43,6 +52,7 @@ class Config:
     streamlink_debug: bool
     delete_recorded_mode: int  # 0=ask, 1=keep, 2=delete
     ffmpeg_binary: str
+    handbrake_binary: str
     streamlink_binary: str
     tcd_binary: str
     request_timeout: int
@@ -79,6 +89,8 @@ class TwitchRecorder:
         logging.info("Timezone: %s", self.cfg.timezone_name)
         logging.info("Chat download: %s", self.cfg.chat_download)
         logging.info("VOD download: %s", self.cfg.download_vod)
+        logging.info("Compress processed: %s", self.cfg.compress_processed_enabled)
+        logging.info("Archive processed: %s", self.cfg.archive_processed_enabled)
         logging.info("Refresh: %.1f segundos", self.cfg.refresh)
 
         self.loopcheck()
@@ -97,6 +109,32 @@ class TwitchRecorder:
             raise ValueError("hls_segments_live debe estar entre 1 y 10")
         if not (1 <= self.cfg.hls_segments_vod <= 10):
             raise ValueError("hls_segments_vod debe estar entre 1 y 10")
+        if self.cfg.compress_processed_enabled and not self.cfg.compress_processed_path:
+            raise ValueError(
+                "Si compress_processed_enabled=true debes indicar compress_processed_path"
+            )
+        if self.cfg.compress_processed_enabled and not self.cfg.compress_processed_preset_file:
+            raise ValueError(
+                "Si compress_processed_enabled=true debes indicar compress_processed_preset_file"
+            )
+        if self.cfg.compress_processed_enabled and not self.cfg.compress_processed_preset_name:
+            raise ValueError(
+                "Si compress_processed_enabled=true debes indicar compress_processed_preset_name"
+            )
+        if (
+            self.cfg.compress_processed_enabled
+            and self.cfg.archive_processed_enabled
+            and self.cfg.archive_processed_mode == "move"
+        ):
+            raise ValueError(
+                "No se puede usar archive_processed_mode=move junto con la compresion en background"
+            )
+        if self.cfg.archive_processed_mode not in {"copy", "move"}:
+            raise ValueError("archive_processed_mode debe ser 'copy' o 'move'")
+        if self.cfg.archive_processed_enabled and not self.cfg.archive_processed_path:
+            raise ValueError(
+                "Si archive_processed_enabled=true debes indicar archive_processed_path"
+            )
 
         try:
             ZoneInfo(self.cfg.timezone_name)
@@ -108,6 +146,17 @@ class TwitchRecorder:
         for binary in required:
             if shutil.which(binary) is None:
                 raise RuntimeError(f"No se encontró '{binary}' en PATH")
+
+        if self.cfg.compress_processed_enabled:
+            if shutil.which(self.cfg.handbrake_binary) is None:
+                raise RuntimeError(f"No se encontró '{self.cfg.handbrake_binary}' en PATH")
+            if (
+                not self.cfg.compress_processed_preset_file
+                or not self.cfg.compress_processed_preset_file.is_file()
+            ):
+                raise RuntimeError(
+                    f"No se encontró preset de HandBrake: {self.cfg.compress_processed_preset_file}"
+                )
 
         if self.cfg.chat_download and shutil.which(self.cfg.tcd_binary) is None:
             raise RuntimeError(
@@ -136,7 +185,10 @@ class TwitchRecorder:
                     file.unlink(missing_ok=True)
 
     def get_app_oauth_token(self) -> str:
-        resp = self.session.post(
+        return self.get_app_oauth_token_for_session(self.session)
+
+    def get_app_oauth_token_for_session(self, session: requests.Session) -> str:
+        resp = session.post(
             self.TWITCH_TOKEN_URL,
             params={
                 "client_id": self.cfg.client_id,
@@ -196,15 +248,84 @@ class TwitchRecorder:
         return data[0] if data else None
 
     def get_latest_vod(self) -> Optional[dict]:
-        resp = self.session.get(
+        return self.get_latest_vod_for_session(
+            self.session,
+            self.oauth_token,
+            self.channel_id,
+        )
+
+    def get_latest_vod_for_session(
+        self,
+        session: requests.Session,
+        oauth_token: Optional[str],
+        channel_id: Optional[str],
+    ) -> Optional[dict]:
+        if not oauth_token:
+            raise RuntimeError("OAuth token no inicializado")
+        if not channel_id:
+            raise RuntimeError("Channel id no inicializado")
+
+        resp = session.get(
             self.TWITCH_VIDEOS_URL,
-            headers=self.get_api_headers(),
-            params={"user_id": self.channel_id, "type": "archive", "first": 1},
+            headers={
+                "Authorization": f"Bearer {oauth_token}",
+                "Client-ID": self.cfg.client_id,
+            },
+            params={"user_id": channel_id, "type": "archive", "first": 1},
             timeout=self.cfg.request_timeout,
         )
         resp.raise_for_status()
         data = resp.json().get("data", [])
         return data[0] if data else None
+
+    def get_latest_vod_with_retry(
+        self, attempts: int = 6, delay_seconds: float = 20.0
+    ) -> Optional[dict]:
+        return self.get_latest_vod_with_retry_for_session(
+            self.session,
+            self.oauth_token,
+            self.channel_id,
+            attempts=attempts,
+            delay_seconds=delay_seconds,
+        )
+
+    def get_latest_vod_with_retry_for_session(
+        self,
+        session: requests.Session,
+        oauth_token: Optional[str],
+        channel_id: Optional[str],
+        attempts: int = 6,
+        delay_seconds: float = 20.0,
+    ) -> Optional[dict]:
+        last_error: Optional[Exception] = None
+
+        for attempt in range(1, attempts + 1):
+            try:
+                vod = self.get_latest_vod_for_session(session, oauth_token, channel_id)
+                if vod:
+                    return vod
+
+                logging.info(
+                    "Aun no hay VOD disponible en Twitch. Intento %s/%s.",
+                    attempt,
+                    attempts,
+                )
+            except Exception as exc:
+                last_error = exc
+                logging.warning(
+                    "No se pudo obtener el ultimo VOD (intento %s/%s): %s",
+                    attempt,
+                    attempts,
+                    exc,
+                )
+
+            if attempt < attempts:
+                time.sleep(delay_seconds)
+
+        if last_error:
+            raise RuntimeError("No se pudo obtener el ultimo VOD tras varios intentos") from last_error
+
+        return None
 
     def loopcheck(self) -> None:
         while True:
@@ -263,15 +384,9 @@ class TwitchRecorder:
             logging.warning("La grabación terminó pero no existe el archivo: %s", recorded_file)
             return
 
-        latest_vod = None
-        try:
-            latest_vod = self.get_latest_vod()
-        except Exception as exc:
-            logging.warning("No se pudo obtener el último VOD: %s", exc)
-
-        processed_dir, recorded_name, processed_name, vod_id = self.build_targets(
+        processed_dir, recorded_name, processed_name = self.build_targets(
             live_info=live_info,
-            latest_vod=latest_vod,
+            latest_vod=None,
             fallback_title=stream_title,
             fallback_game=game_name,
             present_date=present_date,
@@ -287,15 +402,12 @@ class TwitchRecorder:
 
         processed_file = self.make_safe_unique_file(processed_dir / processed_name)
 
-        if self.cfg.chat_download and vod_id:
-            self.download_chat(vod_id, processed_dir, processed_name)
-
-        if self.cfg.download_vod and vod_id:
-            self.download_vod(vod_id, processed_name)
-
         logging.info("Reparando video con ffmpeg...")
         self.run_ffmpeg_fix(recorded_file, processed_file)
         logging.info("Video procesado: %s", processed_file)
+        self.compress_processed_file(processed_file)
+        self.archive_processed_file(processed_file)
+        self.start_post_stream_tasks(processed_dir, processed_name)
 
     def build_targets(
         self,
@@ -305,7 +417,7 @@ class TwitchRecorder:
         fallback_game: str,
         present_date: str,
         present_datetime: str,
-    ) -> tuple[Path, str, str, Optional[str]]:
+    ) -> tuple[Path, str, str]:
         vod_id = None
         game_name = sanitize_name(live_info.get("game_name", fallback_game))
         title = fallback_title
@@ -364,7 +476,7 @@ class TwitchRecorder:
             present_datetime,
         )
 
-        return candidate.parent, recorded_name, candidate.name, vod_id
+        return candidate.parent, recorded_name, candidate.name
 
     def run_streamlink_live(self, output_file: Path) -> None:
         cmd = [self.cfg.streamlink_binary]
@@ -375,7 +487,6 @@ class TwitchRecorder:
         if self.cfg.oauth_private:
             cmd += [
                 "--twitch-api-header=Authorization=OAuth " + self.cfg.oauth_private,
-                "--twitch-disable-ads",
                 "--http-cookie",
                 f"auth-token={self.cfg.oauth_private}",
             ]
@@ -426,6 +537,10 @@ class TwitchRecorder:
             self.cfg.tcd_binary,
             "-v",
             vod_id,
+            "--client-id",
+            self.cfg.client_id,
+            "--client-secret",
+            self.cfg.client_secret,
             "--timezone",
             self.cfg.timezone_name,
             "-f",
@@ -435,7 +550,21 @@ class TwitchRecorder:
         ]
         logging.info("Descargando chat del VOD %s...", vod_id)
         logging.debug("CMD: %s", " ".join(cmd))
-        subprocess.run(cmd, check=False)
+        result = subprocess.run(
+            cmd,
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+
+        if result.returncode != 0:
+            stderr = (result.stderr or "").strip()
+            stdout = (result.stdout or "").strip()
+            details = stderr or stdout or f"codigo de salida {result.returncode}"
+            logging.warning("No se pudo descargar el chat del VOD %s: %s", vod_id, details)
+            return
+
+        logging.info("Chat descargado en: %s", chat_dir)
 
     def download_vod(self, vod_id: str, final_name: str) -> None:
         vod_target = self.make_safe_unique_file(self.recorded_root / f"VOD_{final_name}")
@@ -448,7 +577,6 @@ class TwitchRecorder:
         if self.cfg.oauth_private:
             cmd += [
                 "--twitch-api-header=Authorization=OAuth " + self.cfg.oauth_private,
-                "--twitch-disable-ads",
                 "--http-cookie",
                 f"auth-token={self.cfg.oauth_private}",
             ]
@@ -468,6 +596,104 @@ class TwitchRecorder:
 
     def now_local(self) -> datetime:
         return datetime.now(ZoneInfo(self.cfg.timezone_name))
+
+    def compress_processed_file(self, processed_file: Path) -> None:
+        if (
+            not self.cfg.compress_processed_enabled
+            or not self.cfg.compress_processed_path
+            or not self.cfg.compress_processed_preset_file
+        ):
+            return
+
+        compress_root = self.cfg.compress_processed_path.expanduser().resolve()
+        compress_root.mkdir(parents=True, exist_ok=True)
+
+        compressed_target = self.make_safe_unique_file(
+            compress_root / f"{processed_file.stem}{self.cfg.compress_processed_suffix}{processed_file.suffix}"
+        )
+        log_file = compressed_target.with_suffix(".handbrake.log")
+
+        cmd = [
+            self.cfg.handbrake_binary,
+            "--preset-import-file",
+            str(self.cfg.compress_processed_preset_file),
+            "--preset",
+            self.cfg.compress_processed_preset_name,
+            "-i",
+            str(processed_file),
+            "-o",
+            str(compressed_target),
+        ]
+
+        logging.info("Iniciando compresion en background: %s", compressed_target)
+        logging.debug("CMD: %s", " ".join(cmd))
+
+        with log_file.open("ab") as log_handle:
+            subprocess.Popen(
+                cmd,
+                stdout=log_handle,
+                stderr=subprocess.STDOUT,
+                start_new_session=True,
+            )
+
+    def archive_processed_file(self, processed_file: Path) -> None:
+        if not self.cfg.archive_processed_enabled or not self.cfg.archive_processed_path:
+            return
+
+        archive_root = self.cfg.archive_processed_path.expanduser().resolve()
+        archive_root.mkdir(parents=True, exist_ok=True)
+
+        archive_target = self.make_safe_unique_file(archive_root / processed_file.name)
+
+        if self.cfg.archive_processed_mode == "move":
+            shutil.move(str(processed_file), str(archive_target))
+            logging.info("Archivo procesado movido a: %s", archive_target)
+            return
+
+        shutil.copy2(processed_file, archive_target)
+        logging.info("Archivo procesado copiado a: %s", archive_target)
+
+    def start_post_stream_tasks(self, processed_dir: Path, processed_name: str) -> None:
+        if not (self.cfg.chat_download or self.cfg.download_vod):
+            return
+
+        worker = threading.Thread(
+            target=self.run_post_stream_tasks,
+            args=(processed_dir, processed_name),
+            daemon=True,
+            name=f"post-stream-{self.cfg.username}",
+        )
+        worker.start()
+        logging.info("Tareas de VOD/chat lanzadas en background.")
+
+    def run_post_stream_tasks(self, processed_dir: Path, processed_name: str) -> None:
+        session = requests.Session()
+
+        try:
+            oauth_token = self.get_app_oauth_token_for_session(session)
+            latest_vod = self.get_latest_vod_with_retry_for_session(
+                session,
+                oauth_token,
+                self.channel_id,
+            )
+        except Exception as exc:
+            logging.warning("No se pudo obtener el ultimo VOD: %s", exc)
+            return
+
+        if not latest_vod:
+            logging.warning("No se encontro VOD para tareas post-stream.")
+            return
+
+        vod_id = latest_vod.get("id")
+        if not vod_id:
+            logging.warning("El VOD obtenido no trae id. Se omiten tareas post-stream.")
+            return
+
+        if self.cfg.chat_download:
+            self.download_chat(vod_id, processed_dir, processed_name)
+
+        if self.cfg.download_vod:
+            self.download_vod(vod_id, processed_name)
 
     def make_unique_file(self, path: Path) -> Path:
         if not path.exists():
@@ -620,6 +846,41 @@ def build_parser() -> argparse.ArgumentParser:
 
     parser.add_argument("--chat-download", action="store_true", default=env_bool("TWITCH_CHAT_DOWNLOAD", False))
     parser.add_argument("--download-vod", action="store_true", default=env_bool("TWITCH_DOWNLOAD_VOD", False))
+    parser.add_argument(
+        "--compress-processed-enabled",
+        action="store_true",
+        default=env_bool("TWITCH_COMPRESS_PROCESSED_ENABLED", False),
+    )
+    parser.add_argument(
+        "--compress-processed-path",
+        default=os.getenv("TWITCH_COMPRESS_PROCESSED_PATH", ""),
+    )
+    parser.add_argument(
+        "--compress-processed-preset-file",
+        default=os.getenv("TWITCH_COMPRESS_PROCESSED_PRESET_FILE", ""),
+    )
+    parser.add_argument(
+        "--compress-processed-preset-name",
+        default=os.getenv("TWITCH_COMPRESS_PROCESSED_PRESET_NAME", ""),
+    )
+    parser.add_argument(
+        "--compress-processed-suffix",
+        default=os.getenv("TWITCH_COMPRESS_PROCESSED_SUFFIX", "_compressed"),
+    )
+    parser.add_argument(
+        "--archive-processed-enabled",
+        action="store_true",
+        default=env_bool("TWITCH_ARCHIVE_PROCESSED_ENABLED", False),
+    )
+    parser.add_argument(
+        "--archive-processed-path",
+        default=os.getenv("TWITCH_ARCHIVE_PROCESSED_PATH", ""),
+    )
+    parser.add_argument(
+        "--archive-processed-mode",
+        default=os.getenv("TWITCH_ARCHIVE_PROCESSED_MODE", "copy").strip().lower(),
+        choices=["copy", "move"],
+    )
     parser.add_argument("--make-stream-folder", action="store_true", default=env_bool("TWITCH_MAKE_STREAM_FOLDER", False))
     parser.add_argument("--short-folder", action="store_true", default=env_bool("TWITCH_SHORT_FOLDER", False))
     parser.add_argument("--streamlink-debug", action="store_true", default=env_bool("TWITCH_STREAMLINK_DEBUG", False))
@@ -636,6 +897,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
 
     parser.add_argument("--ffmpeg-binary", default=os.getenv("FFMPEG_BINARY", "ffmpeg"))
+    parser.add_argument("--handbrake-binary", default=os.getenv("HANDBRAKE_BINARY", "HandBrakeCLI"))
     parser.add_argument("--streamlink-binary", default=os.getenv("STREAMLINK_BINARY", "streamlink"))
     parser.add_argument("--tcd-binary", default=os.getenv("TCD_BINARY", "tcd"))
 
@@ -661,6 +923,26 @@ def build_config(args: argparse.Namespace) -> Config:
         timezone_name=args.timezone,
         chat_download=args.chat_download,
         download_vod=args.download_vod,
+        compress_processed_enabled=args.compress_processed_enabled,
+        compress_processed_path=(
+            Path(args.compress_processed_path).expanduser().resolve()
+            if args.compress_processed_path
+            else None
+        ),
+        compress_processed_preset_file=(
+            Path(args.compress_processed_preset_file).expanduser().resolve()
+            if args.compress_processed_preset_file
+            else None
+        ),
+        compress_processed_preset_name=args.compress_processed_preset_name,
+        compress_processed_suffix=args.compress_processed_suffix,
+        archive_processed_enabled=args.archive_processed_enabled,
+        archive_processed_path=(
+            Path(args.archive_processed_path).expanduser().resolve()
+            if args.archive_processed_path
+            else None
+        ),
+        archive_processed_mode=args.archive_processed_mode,
         make_stream_folder=args.make_stream_folder,
         short_folder=args.short_folder,
         hls_segments_live=args.hls_segments_live,
@@ -668,6 +950,7 @@ def build_config(args: argparse.Namespace) -> Config:
         streamlink_debug=args.streamlink_debug,
         delete_recorded_mode=args.delete_recorded_mode,
         ffmpeg_binary=args.ffmpeg_binary,
+        handbrake_binary=args.handbrake_binary,
         streamlink_binary=args.streamlink_binary,
         tcd_binary=args.tcd_binary,
         request_timeout=args.request_timeout,
