@@ -12,7 +12,7 @@ import sys
 import threading
 import time
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Optional
 
@@ -56,7 +56,62 @@ class Config:
     streamlink_binary: str
     tcd_binary: str
     request_timeout: int
+    telegram_notifications_enabled: bool
+    telegram_bot_token: str
+    telegram_chat_id: str
+    telegram_message_thread_id: int | None
+    telegram_notify_startup: bool
+    telegram_notify_live: bool
+    telegram_notify_recording_started: bool
+    telegram_notify_recording_done: bool
+    telegram_notify_processed: bool
+    telegram_notify_post_tasks: bool
+    telegram_notify_errors: bool
     log_level: str
+
+
+class TelegramNotifier:
+    def __init__(self, cfg: Config) -> None:
+        self.cfg = cfg
+
+    @property
+    def enabled(self) -> bool:
+        return (
+            self.cfg.telegram_notifications_enabled
+            and bool(self.cfg.telegram_bot_token)
+            and bool(self.cfg.telegram_chat_id)
+        )
+
+    def send(self, message: str) -> None:
+        if not self.enabled:
+            return
+
+        worker = threading.Thread(
+            target=self.send_sync,
+            args=(message,),
+            daemon=True,
+            name="telegram-notifier",
+        )
+        worker.start()
+
+    def send_sync(self, message: str) -> None:
+        if not self.enabled:
+            return
+
+        url = f"https://api.telegram.org/bot{self.cfg.telegram_bot_token}/sendMessage"
+        payload = {
+            "chat_id": self.cfg.telegram_chat_id,
+            "text": message,
+            "disable_web_page_preview": True,
+        }
+        if self.cfg.telegram_message_thread_id is not None:
+            payload["message_thread_id"] = self.cfg.telegram_message_thread_id
+
+        try:
+            resp = requests.post(url, data=payload, timeout=self.cfg.request_timeout)
+            resp.raise_for_status()
+        except Exception as exc:
+            logging.warning("No se pudo enviar notificación Telegram: %s", exc)
 
 
 class TwitchRecorder:
@@ -68,6 +123,7 @@ class TwitchRecorder:
     def __init__(self, cfg: Config) -> None:
         self.cfg = cfg
         self.session = requests.Session()
+        self.notifier = TelegramNotifier(cfg)
         self.oauth_token: Optional[str] = None
         self.channel_id: Optional[str] = None
 
@@ -92,6 +148,13 @@ class TwitchRecorder:
         logging.info("Compress processed: %s", self.cfg.compress_processed_enabled)
         logging.info("Archive processed: %s", self.cfg.archive_processed_enabled)
         logging.info("Refresh: %.1f segundos", self.cfg.refresh)
+
+        if self.cfg.telegram_notify_startup:
+            self.notify(
+                "Kala Stream Downloader iniciado.\n"
+                f"Canal: {self.cfg.username}\n"
+                f"Root: {self.cfg.root_path}"
+            )
 
         self.loopcheck()
 
@@ -135,11 +198,25 @@ class TwitchRecorder:
             raise ValueError(
                 "Si archive_processed_enabled=true debes indicar archive_processed_path"
             )
+        if self.cfg.telegram_notifications_enabled:
+            if not self.cfg.telegram_bot_token:
+                raise ValueError(
+                    "Si telegram_notifications_enabled=true debes indicar telegram_bot_token"
+                )
+            if not self.cfg.telegram_chat_id:
+                raise ValueError(
+                    "Si telegram_notifications_enabled=true debes indicar telegram_chat_id"
+                )
 
         try:
             ZoneInfo(self.cfg.timezone_name)
         except Exception as exc:
             raise ValueError(f"Timezone inválida: {self.cfg.timezone_name}") from exc
+
+    def notify(self, message: str, *, errors_only: bool = False) -> None:
+        if errors_only and not self.cfg.telegram_notify_errors:
+            return
+        self.notifier.send(message)
 
     def ensure_dependencies(self) -> None:
         required = [self.cfg.streamlink_binary, self.cfg.ffmpeg_binary]
@@ -247,19 +324,13 @@ class TwitchRecorder:
         data = resp.json().get("data", [])
         return data[0] if data else None
 
-    def get_latest_vod(self) -> Optional[dict]:
-        return self.get_latest_vod_for_session(
-            self.session,
-            self.oauth_token,
-            self.channel_id,
-        )
-
-    def get_latest_vod_for_session(
+    def get_recent_vods_for_session(
         self,
         session: requests.Session,
         oauth_token: Optional[str],
         channel_id: Optional[str],
-    ) -> Optional[dict]:
+        first: int = 5,
+    ) -> list[dict]:
         if not oauth_token:
             raise RuntimeError("OAuth token no inicializado")
         if not channel_id:
@@ -271,29 +342,19 @@ class TwitchRecorder:
                 "Authorization": f"Bearer {oauth_token}",
                 "Client-ID": self.cfg.client_id,
             },
-            params={"user_id": channel_id, "type": "archive", "first": 1},
+            params={"user_id": channel_id, "type": "archive", "first": first},
             timeout=self.cfg.request_timeout,
         )
         resp.raise_for_status()
-        data = resp.json().get("data", [])
-        return data[0] if data else None
+        return resp.json().get("data", [])
 
-    def get_latest_vod_with_retry(
-        self, attempts: int = 6, delay_seconds: float = 20.0
-    ) -> Optional[dict]:
-        return self.get_latest_vod_with_retry_for_session(
-            self.session,
-            self.oauth_token,
-            self.channel_id,
-            attempts=attempts,
-            delay_seconds=delay_seconds,
-        )
-
-    def get_latest_vod_with_retry_for_session(
+    def get_matching_vod_with_retry_for_session(
         self,
         session: requests.Session,
         oauth_token: Optional[str],
         channel_id: Optional[str],
+        stream_started_at: Optional[datetime],
+        stream_finished_at: datetime,
         attempts: int = 6,
         delay_seconds: float = 20.0,
     ) -> Optional[dict]:
@@ -301,19 +362,33 @@ class TwitchRecorder:
 
         for attempt in range(1, attempts + 1):
             try:
-                vod = self.get_latest_vod_for_session(session, oauth_token, channel_id)
-                if vod:
-                    return vod
+                vods = self.get_recent_vods_for_session(
+                    session,
+                    oauth_token,
+                    channel_id,
+                    first=5,
+                )
+                if not stream_started_at:
+                    if vods:
+                        return vods[0]
+                else:
+                    match = self.find_matching_vod(
+                        vods,
+                        stream_started_at,
+                        stream_finished_at,
+                    )
+                    if match:
+                        return match
 
                 logging.info(
-                    "Aun no hay VOD disponible en Twitch. Intento %s/%s.",
+                    "Aun no hay VOD compatible disponible en Twitch. Intento %s/%s.",
                     attempt,
                     attempts,
                 )
             except Exception as exc:
                 last_error = exc
                 logging.warning(
-                    "No se pudo obtener el ultimo VOD (intento %s/%s): %s",
+                    "No se pudo obtener VOD compatible (intento %s/%s): %s",
                     attempt,
                     attempts,
                     exc,
@@ -323,7 +398,25 @@ class TwitchRecorder:
                 time.sleep(delay_seconds)
 
         if last_error:
-            raise RuntimeError("No se pudo obtener el ultimo VOD tras varios intentos") from last_error
+            raise RuntimeError("No se pudo obtener VOD compatible tras varios intentos") from last_error
+
+        return None
+
+    def find_matching_vod(
+        self,
+        vods: list[dict],
+        stream_started_at: datetime,
+        stream_finished_at: datetime,
+    ) -> Optional[dict]:
+        window_start = stream_started_at - timedelta(minutes=15)
+        window_end = stream_finished_at + timedelta(minutes=30)
+
+        for vod in vods:
+            created_at = parse_twitch_datetime(vod.get("created_at"))
+            if not created_at:
+                continue
+            if window_start <= created_at <= window_end:
+                return vod
 
         return None
 
@@ -361,6 +454,12 @@ class TwitchRecorder:
                 self.handle_live_stream(live_info)
             except Exception as exc:
                 logging.exception("Error procesando stream: %s", exc)
+                self.notify(
+                    "Error procesando stream.\n"
+                    f"Canal: {self.cfg.username}\n"
+                    f"Detalle: {exc}",
+                    errors_only=True,
+                )
 
             logging.info("Volviendo a monitorear...")
             time.sleep(self.cfg.refresh)
@@ -368,9 +467,19 @@ class TwitchRecorder:
     def handle_live_stream(self, live_info: dict) -> None:
         present_date = self.now_local().strftime("%Y%m%d")
         present_datetime = self.now_local().strftime("%Y%m%d_%Hh%Mm%Ss")
+        stream_started_at = parse_twitch_datetime(live_info.get("started_at"))
 
         stream_title = sanitize_name(live_info.get("title", "Untitled"))
         game_name = sanitize_name(live_info.get("game_name", "UnknownGame"))
+
+        if self.cfg.telegram_notify_live:
+            self.notify(
+                "Stream detectado en vivo.\n"
+                f"Canal: {self.cfg.username}\n"
+                f"Titulo: {stream_title}\n"
+                f"Juego: {game_name}\n"
+                f"Calidad: {self.cfg.quality}"
+            )
 
         initial_name = sanitize_name(
             f"{present_datetime}_{stream_title}_{game_name}_{self.cfg.username}.mp4"
@@ -378,15 +487,132 @@ class TwitchRecorder:
 
         recorded_file = self.make_safe_unique_file(self.recorded_root / initial_name)
 
-        self.run_streamlink_live(recorded_file)
+        if self.cfg.telegram_notify_recording_started:
+            self.notify(
+                "Grabación iniciada.\n"
+                f"Canal: {self.cfg.username}\n"
+                f"Calidad: {self.cfg.quality}\n"
+                f"Archivo: {recorded_file}"
+            )
+
+        streamlink_returncode = self.run_streamlink_live(recorded_file)
+        stream_finished_at = datetime.now(timezone.utc)
 
         if not recorded_file.exists():
             logging.warning("La grabación terminó pero no existe el archivo: %s", recorded_file)
+            self.notify(
+                "La grabación terminó, pero no se encontró el archivo generado.\n"
+                f"Canal: {self.cfg.username}\n"
+                f"Archivo esperado: {recorded_file}",
+                errors_only=True,
+            )
             return
 
+        if streamlink_returncode != 0:
+            logging.warning(
+                "streamlink terminó con código %s. Se intentará procesar el archivo existente.",
+                streamlink_returncode,
+            )
+            self.notify(
+                "streamlink terminó con error, pero existe un archivo grabado.\n"
+                f"Canal: {self.cfg.username}\n"
+                f"Codigo: {streamlink_returncode}\n"
+                f"Archivo: {recorded_file}",
+                errors_only=True,
+            )
+
+        if self.cfg.telegram_notify_recording_done:
+            self.notify(
+                "Grabación terminada.\n"
+                f"Canal: {self.cfg.username}\n"
+                f"Archivo: {recorded_file}"
+            )
+
+        self.start_recording_processing(
+            recorded_file=recorded_file,
+            live_info=live_info,
+            stream_title=stream_title,
+            game_name=game_name,
+            present_date=present_date,
+            present_datetime=present_datetime,
+            stream_started_at=stream_started_at,
+            stream_finished_at=stream_finished_at,
+        )
+
+    def start_recording_processing(
+        self,
+        recorded_file: Path,
+        live_info: dict,
+        stream_title: str,
+        game_name: str,
+        present_date: str,
+        present_datetime: str,
+        stream_started_at: Optional[datetime],
+        stream_finished_at: datetime,
+    ) -> None:
+        worker = threading.Thread(
+            target=self.process_recording,
+            kwargs={
+                "recorded_file": recorded_file,
+                "live_info": live_info,
+                "stream_title": stream_title,
+                "game_name": game_name,
+                "present_date": present_date,
+                "present_datetime": present_datetime,
+                "stream_started_at": stream_started_at,
+                "stream_finished_at": stream_finished_at,
+            },
+            daemon=True,
+            name=f"process-recording-{self.cfg.username}",
+        )
+        worker.start()
+        logging.info("Procesamiento de grabación lanzado en background.")
+
+    def process_recording(
+        self,
+        recorded_file: Path,
+        live_info: dict,
+        stream_title: str,
+        game_name: str,
+        present_date: str,
+        present_datetime: str,
+        stream_started_at: Optional[datetime],
+        stream_finished_at: datetime,
+    ) -> None:
+        try:
+            self._process_recording(
+                recorded_file=recorded_file,
+                live_info=live_info,
+                stream_title=stream_title,
+                game_name=game_name,
+                present_date=present_date,
+                present_datetime=present_datetime,
+                stream_started_at=stream_started_at,
+                stream_finished_at=stream_finished_at,
+            )
+        except Exception as exc:
+            logging.exception("Error en procesamiento background: %s", exc)
+            self.notify(
+                "Error en procesamiento background.\n"
+                f"Canal: {self.cfg.username}\n"
+                f"Archivo: {recorded_file}\n"
+                f"Detalle: {exc}",
+                errors_only=True,
+            )
+
+    def _process_recording(
+        self,
+        recorded_file: Path,
+        live_info: dict,
+        stream_title: str,
+        game_name: str,
+        present_date: str,
+        present_datetime: str,
+        stream_started_at: Optional[datetime],
+        stream_finished_at: datetime,
+    ) -> None:
         processed_dir, recorded_name, processed_name = self.build_targets(
             live_info=live_info,
-            latest_vod=None,
             fallback_title=stream_title,
             fallback_game=game_name,
             present_date=present_date,
@@ -403,51 +629,51 @@ class TwitchRecorder:
         processed_file = self.make_safe_unique_file(processed_dir / processed_name)
 
         logging.info("Reparando video con ffmpeg...")
-        self.run_ffmpeg_fix(recorded_file, processed_file)
+        try:
+            self.run_ffmpeg_fix(recorded_file, processed_file)
+        except Exception as exc:
+            logging.exception("No se pudo procesar video con ffmpeg: %s", exc)
+            self.notify(
+                "No se pudo procesar video con ffmpeg.\n"
+                f"Canal: {self.cfg.username}\n"
+                f"Archivo: {recorded_file}\n"
+                f"Detalle: {exc}",
+                errors_only=True,
+            )
+            return
+
         logging.info("Video procesado: %s", processed_file)
+        if self.cfg.telegram_notify_processed:
+            self.notify(
+                "Video procesado correctamente.\n"
+                f"Canal: {self.cfg.username}\n"
+                f"Archivo: {processed_file}"
+            )
         self.compress_processed_file(processed_file)
         self.archive_processed_file(processed_file)
-        self.start_post_stream_tasks(processed_dir, processed_name)
+        self.start_post_stream_tasks(
+            processed_dir,
+            processed_name,
+            stream_started_at,
+            stream_finished_at,
+        )
 
     def build_targets(
         self,
         live_info: dict,
-        latest_vod: Optional[dict],
         fallback_title: str,
         fallback_game: str,
         present_date: str,
         present_datetime: str,
     ) -> tuple[Path, str, str]:
-        vod_id = None
         game_name = sanitize_name(live_info.get("game_name", fallback_game))
         title = fallback_title
         date_prefix = present_date
-        datetime_prefix = self.now_local().strftime("%Y%m%d_(%H-%M)")
         time_suffix = present_datetime.split("_", 1)[1]
 
-        if latest_vod:
-            vod_id = latest_vod.get("id")
-            title = sanitize_name(latest_vod.get("title", fallback_title))
-            created_at = latest_vod.get("created_at")
-            if created_at:
-                dt_utc = datetime.fromisoformat(created_at.replace("Z", "+00:00"))
-                dt_local = dt_utc.astimezone(ZoneInfo(self.cfg.timezone_name))
-                date_prefix = dt_local.strftime("%Y%m%d")
-                datetime_prefix = dt_local.strftime("%Y%m%d_(%H-%M)")
-
-        if vod_id:
-            filename = sanitize_name(
-                f"{datetime_prefix}_{vod_id}_{title}_{game_name}_{self.cfg.username}.mp4"
-            )
-        else:
-            recorded_name = sanitize_name(
-                f"{present_datetime}_{title}_{game_name}_{self.cfg.username}.mp4"
-            )
-
-        if vod_id:
-            recorded_name = sanitize_name(
-                f"{datetime_prefix}_{vod_id}_{title}_{game_name}_{self.cfg.username}.mp4"
-            )
+        recorded_name = sanitize_name(
+            f"{present_datetime}_{title}_{game_name}_{self.cfg.username}.mp4"
+        )
 
         processed_name = sanitize_name(
             f"{present_date}_{fallback_title}_{time_suffix}.mp4"
@@ -478,7 +704,7 @@ class TwitchRecorder:
 
         return candidate.parent, recorded_name, candidate.name
 
-    def run_streamlink_live(self, output_file: Path) -> None:
+    def run_streamlink_live(self, output_file: Path) -> int:
         cmd = [self.cfg.streamlink_binary]
 
         if self.cfg.streamlink_debug:
@@ -505,7 +731,8 @@ class TwitchRecorder:
 
         logging.info("Iniciando streamlink live...")
         logging.debug("CMD: %s", " ".join(cmd))
-        subprocess.run(cmd, check=False)
+        result = subprocess.run(cmd, check=False)
+        return result.returncode
 
     def run_ffmpeg_fix(self, input_file: Path, output_file: Path) -> None:
         cmd = [
@@ -562,9 +789,21 @@ class TwitchRecorder:
             stdout = (result.stdout or "").strip()
             details = stderr or stdout or f"codigo de salida {result.returncode}"
             logging.warning("No se pudo descargar el chat del VOD %s: %s", vod_id, details)
+            self.notify(
+                "No se pudo descargar el chat.\n"
+                f"VOD: {vod_id}\n"
+                f"Detalle: {details}",
+                errors_only=True,
+            )
             return
 
         logging.info("Chat descargado en: %s", chat_dir)
+        if self.cfg.telegram_notify_post_tasks:
+            self.notify(
+                "Chat descargado correctamente.\n"
+                f"VOD: {vod_id}\n"
+                f"Carpeta: {chat_dir}"
+            )
 
     def download_vod(self, vod_id: str, final_name: str) -> None:
         vod_target = self.make_safe_unique_file(self.recorded_root / f"VOD_{final_name}")
@@ -592,7 +831,23 @@ class TwitchRecorder:
 
         logging.info("Descargando VOD %s...", vod_id)
         logging.debug("CMD: %s", " ".join(cmd))
-        subprocess.run(cmd, check=False)
+        result = subprocess.run(cmd, check=False)
+        if result.returncode != 0:
+            logging.warning("No se pudo descargar el VOD %s. Codigo: %s", vod_id, result.returncode)
+            self.notify(
+                "No se pudo descargar el VOD.\n"
+                f"VOD: {vod_id}\n"
+                f"Codigo: {result.returncode}",
+                errors_only=True,
+            )
+            return
+
+        if self.cfg.telegram_notify_post_tasks:
+            self.notify(
+                "VOD descargado correctamente.\n"
+                f"VOD: {vod_id}\n"
+                f"Archivo: {vod_target}"
+            )
 
     def now_local(self) -> datetime:
         return datetime.now(ZoneInfo(self.cfg.timezone_name))
@@ -629,12 +884,55 @@ class TwitchRecorder:
         logging.debug("CMD: %s", " ".join(cmd))
 
         with log_file.open("ab") as log_handle:
-            subprocess.Popen(
+            process = subprocess.Popen(
                 cmd,
                 stdout=log_handle,
                 stderr=subprocess.STDOUT,
                 start_new_session=True,
             )
+
+        should_watch_compression = (
+            self.cfg.telegram_notify_post_tasks or self.cfg.telegram_notify_errors
+        )
+
+        if self.cfg.telegram_notify_post_tasks:
+            self.notify(
+                "Compresión iniciada en background.\n"
+                f"Origen: {processed_file}\n"
+                f"Destino: {compressed_target}"
+            )
+
+        if should_watch_compression:
+            worker = threading.Thread(
+                target=self.watch_compression_process,
+                args=(process, compressed_target, log_file),
+                daemon=True,
+                name=f"handbrake-{self.cfg.username}",
+            )
+            worker.start()
+
+    def watch_compression_process(
+        self,
+        process: subprocess.Popen,
+        compressed_target: Path,
+        log_file: Path,
+    ) -> None:
+        returncode = process.wait()
+        if returncode == 0:
+            if self.cfg.telegram_notify_post_tasks:
+                self.notify(
+                    "Compresión terminada correctamente.\n"
+                    f"Archivo: {compressed_target}"
+                )
+            return
+
+        logging.warning("HandBrake terminó con código %s. Log: %s", returncode, log_file)
+        self.notify(
+            "La compresión terminó con error.\n"
+            f"Codigo: {returncode}\n"
+            f"Log: {log_file}",
+            errors_only=True,
+        )
 
     def archive_processed_file(self, processed_file: Path) -> None:
         if not self.cfg.archive_processed_enabled or not self.cfg.archive_processed_path:
@@ -648,45 +946,80 @@ class TwitchRecorder:
         if self.cfg.archive_processed_mode == "move":
             shutil.move(str(processed_file), str(archive_target))
             logging.info("Archivo procesado movido a: %s", archive_target)
+            if self.cfg.telegram_notify_post_tasks:
+                self.notify(
+                    "Archivo procesado movido.\n"
+                    f"Destino: {archive_target}"
+                )
             return
 
         shutil.copy2(processed_file, archive_target)
         logging.info("Archivo procesado copiado a: %s", archive_target)
+        if self.cfg.telegram_notify_post_tasks:
+            self.notify(
+                "Archivo procesado copiado.\n"
+                f"Destino: {archive_target}"
+            )
 
-    def start_post_stream_tasks(self, processed_dir: Path, processed_name: str) -> None:
+    def start_post_stream_tasks(
+        self,
+        processed_dir: Path,
+        processed_name: str,
+        stream_started_at: Optional[datetime],
+        stream_finished_at: datetime,
+    ) -> None:
         if not (self.cfg.chat_download or self.cfg.download_vod):
             return
 
         worker = threading.Thread(
             target=self.run_post_stream_tasks,
-            args=(processed_dir, processed_name),
+            args=(processed_dir, processed_name, stream_started_at, stream_finished_at),
             daemon=True,
             name=f"post-stream-{self.cfg.username}",
         )
         worker.start()
         logging.info("Tareas de VOD/chat lanzadas en background.")
 
-    def run_post_stream_tasks(self, processed_dir: Path, processed_name: str) -> None:
+    def run_post_stream_tasks(
+        self,
+        processed_dir: Path,
+        processed_name: str,
+        stream_started_at: Optional[datetime],
+        stream_finished_at: datetime,
+    ) -> None:
         session = requests.Session()
 
         try:
             oauth_token = self.get_app_oauth_token_for_session(session)
-            latest_vod = self.get_latest_vod_with_retry_for_session(
+            latest_vod = self.get_matching_vod_with_retry_for_session(
                 session,
                 oauth_token,
                 self.channel_id,
+                stream_started_at,
+                stream_finished_at,
             )
         except Exception as exc:
             logging.warning("No se pudo obtener el ultimo VOD: %s", exc)
+            self.notify(
+                "No se pudo obtener el último VOD para tareas post-stream.\n"
+                f"Detalle: {exc}",
+                errors_only=True,
+            )
             return
 
         if not latest_vod:
             logging.warning("No se encontro VOD para tareas post-stream.")
+            if self.cfg.telegram_notify_post_tasks:
+                self.notify("No se encontró VOD para tareas post-stream.")
             return
 
         vod_id = latest_vod.get("id")
         if not vod_id:
             logging.warning("El VOD obtenido no trae id. Se omiten tareas post-stream.")
+            self.notify(
+                "El VOD obtenido no trae id. Se omiten tareas post-stream.",
+                errors_only=True,
+            )
             return
 
         if self.cfg.chat_download:
@@ -802,6 +1135,19 @@ def sanitize_name(value: str) -> str:
     return result or "untitled"
 
 
+def parse_twitch_datetime(value: Optional[str]) -> Optional[datetime]:
+    if not value:
+        return None
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+
+    if parsed.tzinfo is None:
+        return parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
+
+
 def env_bool(name: str, default: bool = False) -> bool:
     value = os.getenv(name)
     if value is None:
@@ -812,6 +1158,13 @@ def env_bool(name: str, default: bool = False) -> bool:
 def env_int(name: str, default: int) -> int:
     value = os.getenv(name)
     return int(value) if value is not None else default
+
+
+def env_optional_int(name: str) -> int | None:
+    value = os.getenv(name)
+    if value is None or not value.strip():
+        return None
+    return int(value)
 
 
 def env_float(name: str, default: float) -> float:
@@ -844,11 +1197,19 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--refresh", type=float, default=env_float("TWITCH_REFRESH", 5.0))
     parser.add_argument("--timezone", default=os.getenv("TWITCH_TIMEZONE", "America/Santiago"))
 
-    parser.add_argument("--chat-download", action="store_true", default=env_bool("TWITCH_CHAT_DOWNLOAD", False))
-    parser.add_argument("--download-vod", action="store_true", default=env_bool("TWITCH_DOWNLOAD_VOD", False))
+    parser.add_argument(
+        "--chat-download",
+        action=argparse.BooleanOptionalAction,
+        default=env_bool("TWITCH_CHAT_DOWNLOAD", False),
+    )
+    parser.add_argument(
+        "--download-vod",
+        action=argparse.BooleanOptionalAction,
+        default=env_bool("TWITCH_DOWNLOAD_VOD", False),
+    )
     parser.add_argument(
         "--compress-processed-enabled",
-        action="store_true",
+        action=argparse.BooleanOptionalAction,
         default=env_bool("TWITCH_COMPRESS_PROCESSED_ENABLED", False),
     )
     parser.add_argument(
@@ -869,7 +1230,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--archive-processed-enabled",
-        action="store_true",
+        action=argparse.BooleanOptionalAction,
         default=env_bool("TWITCH_ARCHIVE_PROCESSED_ENABLED", False),
     )
     parser.add_argument(
@@ -881,9 +1242,21 @@ def build_parser() -> argparse.ArgumentParser:
         default=os.getenv("TWITCH_ARCHIVE_PROCESSED_MODE", "copy").strip().lower(),
         choices=["copy", "move"],
     )
-    parser.add_argument("--make-stream-folder", action="store_true", default=env_bool("TWITCH_MAKE_STREAM_FOLDER", False))
-    parser.add_argument("--short-folder", action="store_true", default=env_bool("TWITCH_SHORT_FOLDER", False))
-    parser.add_argument("--streamlink-debug", action="store_true", default=env_bool("TWITCH_STREAMLINK_DEBUG", False))
+    parser.add_argument(
+        "--make-stream-folder",
+        action=argparse.BooleanOptionalAction,
+        default=env_bool("TWITCH_MAKE_STREAM_FOLDER", False),
+    )
+    parser.add_argument(
+        "--short-folder",
+        action=argparse.BooleanOptionalAction,
+        default=env_bool("TWITCH_SHORT_FOLDER", False),
+    )
+    parser.add_argument(
+        "--streamlink-debug",
+        action=argparse.BooleanOptionalAction,
+        default=env_bool("TWITCH_STREAMLINK_DEBUG", False),
+    )
 
     parser.add_argument("--hls-segments-live", type=int, default=env_int("TWITCH_HLS_SEGMENTS_LIVE", 3))
     parser.add_argument("--hls-segments-vod", type=int, default=env_int("TWITCH_HLS_SEGMENTS_VOD", 10))
@@ -902,6 +1275,53 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--tcd-binary", default=os.getenv("TCD_BINARY", "tcd"))
 
     parser.add_argument("--request-timeout", type=int, default=env_int("TWITCH_REQUEST_TIMEOUT", 15))
+    parser.add_argument(
+        "--telegram-notifications-enabled",
+        action=argparse.BooleanOptionalAction,
+        default=env_bool("TELEGRAM_NOTIFICATIONS_ENABLED", False),
+    )
+    parser.add_argument("--telegram-bot-token", default=os.getenv("TELEGRAM_BOT_TOKEN", ""))
+    parser.add_argument("--telegram-chat-id", default=os.getenv("TELEGRAM_CHAT_ID", ""))
+    parser.add_argument(
+        "--telegram-message-thread-id",
+        type=int,
+        default=env_optional_int("TELEGRAM_MESSAGE_THREAD_ID"),
+    )
+    parser.add_argument(
+        "--telegram-notify-startup",
+        action=argparse.BooleanOptionalAction,
+        default=env_bool("TELEGRAM_NOTIFY_STARTUP", True),
+    )
+    parser.add_argument(
+        "--telegram-notify-live",
+        action=argparse.BooleanOptionalAction,
+        default=env_bool("TELEGRAM_NOTIFY_LIVE", True),
+    )
+    parser.add_argument(
+        "--telegram-notify-recording-done",
+        action=argparse.BooleanOptionalAction,
+        default=env_bool("TELEGRAM_NOTIFY_RECORDING_DONE", True),
+    )
+    parser.add_argument(
+        "--telegram-notify-recording-started",
+        action=argparse.BooleanOptionalAction,
+        default=env_bool("TELEGRAM_NOTIFY_RECORDING_STARTED", True),
+    )
+    parser.add_argument(
+        "--telegram-notify-processed",
+        action=argparse.BooleanOptionalAction,
+        default=env_bool("TELEGRAM_NOTIFY_PROCESSED", True),
+    )
+    parser.add_argument(
+        "--telegram-notify-post-tasks",
+        action=argparse.BooleanOptionalAction,
+        default=env_bool("TELEGRAM_NOTIFY_POST_TASKS", True),
+    )
+    parser.add_argument(
+        "--telegram-notify-errors",
+        action=argparse.BooleanOptionalAction,
+        default=env_bool("TELEGRAM_NOTIFY_ERRORS", True),
+    )
     parser.add_argument(
         "--log-level",
         default=os.getenv("LOG_LEVEL", "INFO"),
@@ -954,6 +1374,17 @@ def build_config(args: argparse.Namespace) -> Config:
         streamlink_binary=args.streamlink_binary,
         tcd_binary=args.tcd_binary,
         request_timeout=args.request_timeout,
+        telegram_notifications_enabled=args.telegram_notifications_enabled,
+        telegram_bot_token=args.telegram_bot_token,
+        telegram_chat_id=args.telegram_chat_id,
+        telegram_message_thread_id=args.telegram_message_thread_id,
+        telegram_notify_startup=args.telegram_notify_startup,
+        telegram_notify_live=args.telegram_notify_live,
+        telegram_notify_recording_started=args.telegram_notify_recording_started,
+        telegram_notify_recording_done=args.telegram_notify_recording_done,
+        telegram_notify_processed=args.telegram_notify_processed,
+        telegram_notify_post_tasks=args.telegram_notify_post_tasks,
+        telegram_notify_errors=args.telegram_notify_errors,
         log_level=args.log_level,
     )
 
@@ -971,6 +1402,7 @@ def main() -> int:
     parser = build_parser()
     args = parser.parse_args()
     configure_logging(args.log_level)
+    cfg: Config | None = None
 
     try:
         cfg = build_config(args)
@@ -982,6 +1414,12 @@ def main() -> int:
         return 130
     except Exception as exc:
         logging.exception("Error fatal: %s", exc)
+        if cfg and cfg.telegram_notify_errors:
+            TelegramNotifier(cfg).send_sync(
+                "Error fatal en Kala Stream Downloader.\n"
+                f"Canal: {cfg.username}\n"
+                f"Detalle: {exc}"
+            )
         return 1
 
 
