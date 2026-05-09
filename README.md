@@ -15,6 +15,7 @@ Script en Python para monitorear un canal de Twitch, grabar el directo con `stre
 - Puede descargar el VOD completo al terminar el stream.
 - Puede comprimir el archivo procesado con `HandBrakeCLI` usando un preset JSON.
 - Opcionalmente copia o mueve el archivo procesado a una segunda carpeta.
+- Puede limpiar automáticamente archivos antiguos de `recorded/` y `processed/` con un timer de producción.
 - Puede enviar notificaciones a Telegram, incluyendo topics de supergrupos.
 - Las tareas de procesamiento, chat/VOD, archivado y compresión corren en background para no bloquear el monitoreo.
 - Evita sobrescribir archivos existentes generando nombres únicos como `archivo (1).mp4`.
@@ -97,6 +98,9 @@ TWITCH_HLS_SEGMENTS_LIVE=3
 TWITCH_HLS_SEGMENTS_VOD=10
 TWITCH_DELETE_RECORDED_MODE=1
 TWITCH_REQUEST_TIMEOUT=15
+
+CLEANUP_STREAM_FILES_MIN_AGE_HOURS=24
+CLEANUP_STREAM_FILES_TARGETS=recorded,processed
 
 TELEGRAM_NOTIFICATIONS_ENABLED=false
 TELEGRAM_BOT_TOKEN=
@@ -286,9 +290,37 @@ Controla qué pasa con archivos previos dentro de `recorded/<canal>/` al iniciar
 - `1`: no borra nada
 - `2`: borra automáticamente
 
+Para producción, es preferible usar [cleanup-recorded.py](cleanup-recorded.py) con un timer externo en vez de borrar al iniciar el servicio principal.
+
+```bash
+.venv/bin/python cleanup-recorded.py --dry-run
+.venv/bin/python cleanup-recorded.py
+```
+
+Por defecto borra archivos de `recorded/<canal>/` y `processed/<canal>/` con más de 24 horas de antigüedad, para evitar eliminar una grabación o procesamiento activo. También elimina subcarpetas vacías dentro de esas rutas. Puedes cambiar la antigüedad con `--min-age-hours` o con:
+
+```env
+CLEANUP_STREAM_FILES_MIN_AGE_HOURS=24
+```
+
+Si quieres limpiar solo una de las carpetas:
+
+```bash
+.venv/bin/python cleanup-recorded.py --targets recorded
+.venv/bin/python cleanup-recorded.py --targets processed
+```
+
 `TWITCH_REQUEST_TIMEOUT`
 
 Timeout en segundos para las llamadas HTTP a la API de Twitch.
+
+`CLEANUP_STREAM_FILES_MIN_AGE_HOURS`
+
+Antigüedad mínima en horas para que [cleanup-recorded.py](cleanup-recorded.py) borre archivos de streams. Por defecto: `24`.
+
+`CLEANUP_STREAM_FILES_TARGETS`
+
+Lista de carpetas a limpiar bajo `TWITCH_ROOT_PATH`. Por defecto: `recorded,processed`.
 
 `TELEGRAM_NOTIFICATIONS_ENABLED`
 
@@ -380,3 +412,43 @@ Si activas la compresión, el archivo comprimido se genera con este patrón:
 - No se puede combinar compresión en background con `TWITCH_ARCHIVE_PROCESSED_MODE=move`, porque movería el archivo antes de que HandBrake termine de leerlo.
 - Las notificaciones de Telegram se envían en background y no bloquean la detección ni el inicio de grabación. Si Telegram no responde, el flujo principal continúa.
 - Solo el aviso de error fatal intenta enviarse antes de que el proceso termine.
+
+## Limpieza automática en producción
+
+En un servidor con `systemd`, crea un servicio one-shot para ejecutar la limpieza:
+
+```ini
+# /etc/systemd/system/kala-stream-downloader-cleanup.service
+[Unit]
+Description=Kala Stream Downloader cleanup
+
+[Service]
+Type=oneshot
+User=kalaplex
+WorkingDirectory=/home/kalaplex/kala-stream-downloader
+ExecStart=/home/kalaplex/kala-stream-downloader/.venv/bin/python /home/kalaplex/kala-stream-downloader/cleanup-recorded.py
+```
+
+Y un timer diario:
+
+```ini
+# /etc/systemd/system/kala-stream-downloader-cleanup.timer
+[Unit]
+Description=Run Kala Stream Downloader cleanup daily
+
+[Timer]
+OnBootSec=15min
+OnUnitActiveSec=24h
+Persistent=true
+
+[Install]
+WantedBy=timers.target
+```
+
+Actívalo con:
+
+```bash
+sudo systemctl daemon-reload
+sudo systemctl enable --now kala-stream-downloader-cleanup.timer
+systemctl list-timers kala-stream-downloader-cleanup.timer
+```
