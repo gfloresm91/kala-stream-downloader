@@ -1,0 +1,3 @@
+No se pudo descargar el chat.
+VOD: {vod_id}
+Detalle: {details}

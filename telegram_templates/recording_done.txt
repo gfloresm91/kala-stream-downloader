@@ -1,0 +1,3 @@
+Grabación terminada.
+Canal: {channel}
+Archivo: {recorded_file}

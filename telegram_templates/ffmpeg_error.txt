@@ -1,0 +1,4 @@
+No se pudo procesar video con ffmpeg.
+Canal: {channel}
+Archivo: {recorded_file}
+Detalle: {details}

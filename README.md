@@ -90,6 +90,7 @@ TWITCH_COMPRESS_PROCESSED_SUFFIX=_compressed
 TWITCH_ARCHIVE_PROCESSED_ENABLED=false
 TWITCH_ARCHIVE_PROCESSED_PATH=
 TWITCH_ARCHIVE_PROCESSED_MODE=copy
+TWITCH_ARCHIVE_PUBLIC_URL=
 TWITCH_MAKE_STREAM_FOLDER=false
 TWITCH_SHORT_FOLDER=false
 TWITCH_STREAMLINK_DEBUG=false
@@ -113,6 +114,7 @@ TELEGRAM_NOTIFY_RECORDING_DONE=true
 TELEGRAM_NOTIFY_PROCESSED=true
 TELEGRAM_NOTIFY_POST_TASKS=true
 TELEGRAM_NOTIFY_ERRORS=true
+TELEGRAM_TEMPLATES_PATH=telegram_templates
 
 FFMPEG_BINARY=ffmpeg
 HANDBRAKE_BINARY=HandBrakeCLI
@@ -262,6 +264,10 @@ Modo de traslado del archivo procesado:
 - `copy`: recomendado, deja el archivo original en `processed/`
 - `move`: mueve el archivo fuera de `processed/`
 
+`TWITCH_ARCHIVE_PUBLIC_URL`
+
+URL pública opcional para usar en los templates de archivado, por ejemplo `{archive_public_url}` en `archive_copied.txt` o `archive_moved.txt`.
+
 `TWITCH_MAKE_STREAM_FOLDER`
 
 Si está en `true`, crea una carpeta por stream dentro de `processed/<canal>/`.
@@ -367,6 +373,29 @@ Notifica tareas secundarias completadas, como chat descargado, VOD descargado, c
 `TELEGRAM_NOTIFY_ERRORS`
 
 Notifica errores fatales o fallos relevantes, aunque el script pueda seguir monitoreando. Algunos errores de chat, VOD o compresión se notifican con este flag aunque `TELEGRAM_NOTIFY_POST_TASKS=false`.
+
+`TELEGRAM_TEMPLATES_PATH`
+
+Carpeta con archivos `.txt` para personalizar los textos enviados a Telegram. Por defecto usa `telegram_templates/` dentro de la carpeta del proyecto.
+
+Si defines una ruta relativa, se resuelve desde la carpeta donde está `kala-stream-download.py`, no desde la carpeta desde donde ejecutes el comando.
+
+Cada archivo se llama igual que el evento, por ejemplo:
+
+- `startup.txt`
+- `live.txt`
+- `recording_started.txt`
+- `recording_done.txt`
+- `processed.txt`
+- `chat_downloaded.txt`
+- `vod_downloaded.txt`
+- `compression_started.txt`
+- `compression_done.txt`
+- `fatal_error.txt`
+
+Puedes editar esos archivos directamente. Los placeholders se escriben entre llaves, por ejemplo `{channel}`, `{stream_title}`, `{game_name}`, `{quality}`, `{recorded_file}`, `{processed_file}`, `{vod_id}`, `{details}`. Si un archivo no existe, el script usa el texto por defecto incluido en el código.
+
+El listado completo de templates y placeholders disponibles está en [telegram_templates/README.md](telegram_templates/README.md).
 
 `STREAMLINK_BINARY`, `FFMPEG_BINARY`, `HANDBRAKE_BINARY`, `TCD_BINARY`
 

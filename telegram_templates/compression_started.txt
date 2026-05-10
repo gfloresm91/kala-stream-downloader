@@ -1,0 +1,3 @@
+🎬 Compresión en curso.
+Avisaré cuando termine.
+Archivo: {processed_file_name}

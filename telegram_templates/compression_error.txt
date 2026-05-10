@@ -1,0 +1,3 @@
+La compresión terminó con error.
+Codigo: {returncode}
+Log: {log_file}

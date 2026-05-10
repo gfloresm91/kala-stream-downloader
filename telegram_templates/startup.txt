@@ -1,0 +1,3 @@
+Kala Stream Downloader iniciado.
+Canal: {channel}
+Root: {root_path}

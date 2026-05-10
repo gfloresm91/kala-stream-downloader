@@ -1,0 +1,3 @@
+VOD descargado correctamente.
+VOD: {vod_id}
+Archivo: {vod_target}

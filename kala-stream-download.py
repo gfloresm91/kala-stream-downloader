@@ -23,6 +23,162 @@ from zoneinfo import ZoneInfo
 
 INVALID_FS_CHARS = '<>:"/\\|?*'
 MAX_PATH_LEN = 240
+SCRIPT_DIR = Path(__file__).resolve().parent
+DEFAULT_TELEGRAM_TEMPLATES_PATH = SCRIPT_DIR / "telegram_templates"
+
+
+DEFAULT_TELEGRAM_TEMPLATES = {
+    "startup": (
+        "Kala Stream Downloader iniciado.\n"
+        "Canal: {channel}\n"
+        "Root: {root_path}"
+    ),
+    "live": (
+        "Stream detectado en vivo.\n"
+        "Canal: {channel}\n"
+        "Titulo: {stream_title}\n"
+        "Juego: {game_name}\n"
+        "Calidad: {quality}"
+    ),
+    "recording_started": (
+        "Grabación iniciada.\n"
+        "Canal: {channel}\n"
+        "Calidad: {quality}\n"
+        "Archivo: {recorded_file}"
+    ),
+    "recording_missing_file": (
+        "La grabación terminó, pero no se encontró el archivo generado.\n"
+        "Canal: {channel}\n"
+        "Archivo esperado: {recorded_file}"
+    ),
+    "streamlink_error": (
+        "streamlink terminó con error, pero existe un archivo grabado.\n"
+        "Canal: {channel}\n"
+        "Codigo: {returncode}\n"
+        "Archivo: {recorded_file}"
+    ),
+    "recording_done": (
+        "Grabación terminada.\n"
+        "Canal: {channel}\n"
+        "Archivo: {recorded_file}"
+    ),
+    "stream_processing_error": (
+        "Error procesando stream.\n"
+        "Canal: {channel}\n"
+        "Detalle: {details}"
+    ),
+    "background_processing_error": (
+        "Error en procesamiento background.\n"
+        "Canal: {channel}\n"
+        "Archivo: {recorded_file}\n"
+        "Detalle: {details}"
+    ),
+    "ffmpeg_error": (
+        "No se pudo procesar video con ffmpeg.\n"
+        "Canal: {channel}\n"
+        "Archivo: {recorded_file}\n"
+        "Detalle: {details}"
+    ),
+    "processed": (
+        "Video procesado correctamente.\n"
+        "Canal: {channel}\n"
+        "Archivo: {processed_file}"
+    ),
+    "chat_download_error": (
+        "No se pudo descargar el chat.\n"
+        "VOD: {vod_id}\n"
+        "Detalle: {details}"
+    ),
+    "chat_downloaded": (
+        "Chat descargado correctamente.\n"
+        "VOD: {vod_id}\n"
+        "Carpeta: {chat_dir}"
+    ),
+    "vod_download_error": (
+        "No se pudo descargar el VOD.\n"
+        "VOD: {vod_id}\n"
+        "Codigo: {returncode}"
+    ),
+    "vod_downloaded": (
+        "VOD descargado correctamente.\n"
+        "VOD: {vod_id}\n"
+        "Archivo: {vod_target}"
+    ),
+    "compression_started": (
+        "Compresión iniciada en background.\n"
+        "Origen: {processed_file}\n"
+        "Destino: {compressed_target}"
+    ),
+    "compression_done": (
+        "Compresión terminada correctamente.\n"
+        "Archivo: {compressed_target}"
+    ),
+    "compression_error": (
+        "La compresión terminó con error.\n"
+        "Codigo: {returncode}\n"
+        "Log: {log_file}"
+    ),
+    "archive_moved": (
+        "Archivo procesado movido.\n"
+        "Destino: {archive_target}"
+    ),
+    "archive_copied": (
+        "Archivo procesado copiado.\n"
+        "Destino: {archive_target}"
+    ),
+    "post_stream_vod_error": (
+        "No se pudo obtener el último VOD para tareas post-stream.\n"
+        "Detalle: {details}"
+    ),
+    "post_stream_vod_not_found": "No se encontró VOD para tareas post-stream.",
+    "post_stream_vod_missing_id": "El VOD obtenido no trae id. Se omiten tareas post-stream.",
+    "fatal_error": (
+        "Error fatal en Kala Stream Downloader.\n"
+        "Canal: {channel}\n"
+        "Detalle: {details}"
+    ),
+}
+
+
+class SafeTemplateValues(dict):
+    def __missing__(self, key: str) -> str:
+        return "{" + key + "}"
+
+
+class TelegramTemplateRenderer:
+    def __init__(self, templates_path: Path | None) -> None:
+        self.templates_path = templates_path
+
+    def render(self, name: str, **values: object) -> str:
+        template = self.load_template(name)
+        safe_values = SafeTemplateValues(
+            {key: str(value) for key, value in values.items()}
+        )
+
+        try:
+            return template.format_map(safe_values)
+        except Exception as exc:
+            logging.warning(
+                "No se pudo renderizar template Telegram '%s': %s. Usando texto sin formato.",
+                name,
+                exc,
+            )
+            return template
+
+    def load_template(self, name: str) -> str:
+        if self.templates_path:
+            template_file = self.templates_path / f"{name}.txt"
+            if template_file.is_file():
+                try:
+                    return template_file.read_text(encoding="utf-8").strip()
+                except OSError as exc:
+                    logging.warning(
+                        "No se pudo leer template Telegram '%s': %s",
+                        template_file,
+                        exc,
+                    )
+
+        return DEFAULT_TELEGRAM_TEMPLATES[name]
 
 
 @dataclass
@@ -45,6 +201,7 @@ class Config:
     archive_processed_enabled: bool
     archive_processed_path: Path | None
     archive_processed_mode: str
+    archive_public_url: str
     make_stream_folder: bool
     short_folder: bool
     hls_segments_live: int
@@ -67,6 +224,7 @@ class Config:
     telegram_notify_processed: bool
     telegram_notify_post_tasks: bool
     telegram_notify_errors: bool
+    telegram_templates_path: Path | None
     log_level: str
 
 
@@ -124,6 +282,7 @@ class TwitchRecorder:
         self.cfg = cfg
         self.session = requests.Session()
         self.notifier = TelegramNotifier(cfg)
+        self.template_renderer = TelegramTemplateRenderer(cfg.telegram_templates_path)
         self.oauth_token: Optional[str] = None
         self.channel_id: Optional[str] = None
 
@@ -148,12 +307,13 @@ class TwitchRecorder:
         logging.info("Compress processed: %s", self.cfg.compress_processed_enabled)
         logging.info("Archive processed: %s", self.cfg.archive_processed_enabled)
         logging.info("Refresh: %.1f segundos", self.cfg.refresh)
+        self.log_telegram_templates_path()
 
         if self.cfg.telegram_notify_startup:
-            self.notify(
-                "Kala Stream Downloader iniciado.\n"
-                f"Canal: {self.cfg.username}\n"
-                f"Root: {self.cfg.root_path}"
+            self.notify_template(
+                "startup",
+                channel=self.cfg.username,
+                root_path=self.cfg.root_path,
             )
 
         self.loopcheck()
@@ -217,6 +377,30 @@ class TwitchRecorder:
         if errors_only and not self.cfg.telegram_notify_errors:
             return
         self.notifier.send(message)
+
+    def notify_template(
+        self,
+        template_name: str,
+        *,
+        errors_only: bool = False,
+        **values: object,
+    ) -> None:
+        message = self.template_renderer.render(template_name, **values)
+        self.notify(message, errors_only=errors_only)
+
+    def log_telegram_templates_path(self) -> None:
+        if not self.cfg.telegram_templates_path:
+            logging.info("Templates Telegram: defaults internos")
+            return
+
+        if self.cfg.telegram_templates_path.is_dir():
+            logging.info("Templates Telegram: %s", self.cfg.telegram_templates_path)
+            return
+
+        logging.warning(
+            "Carpeta de templates Telegram no encontrada: %s. Se usarán defaults internos.",
+            self.cfg.telegram_templates_path,
+        )
 
     def ensure_dependencies(self) -> None:
         required = [self.cfg.streamlink_binary, self.cfg.ffmpeg_binary]
@@ -454,10 +638,10 @@ class TwitchRecorder:
                 self.handle_live_stream(live_info)
             except Exception as exc:
                 logging.exception("Error procesando stream: %s", exc)
-                self.notify(
-                    "Error procesando stream.\n"
-                    f"Canal: {self.cfg.username}\n"
-                    f"Detalle: {exc}",
+                self.notify_template(
+                    "stream_processing_error",
+                    channel=self.cfg.username,
+                    details=exc,
                     errors_only=True,
                 )
 
@@ -473,12 +657,12 @@ class TwitchRecorder:
         game_name = sanitize_name(live_info.get("game_name", "UnknownGame"))
 
         if self.cfg.telegram_notify_live:
-            self.notify(
-                "Stream detectado en vivo.\n"
-                f"Canal: {self.cfg.username}\n"
-                f"Titulo: {stream_title}\n"
-                f"Juego: {game_name}\n"
-                f"Calidad: {self.cfg.quality}"
+            self.notify_template(
+                "live",
+                channel=self.cfg.username,
+                stream_title=stream_title,
+                game_name=game_name,
+                quality=self.cfg.quality,
             )
 
         initial_name = sanitize_name(
@@ -488,11 +672,12 @@ class TwitchRecorder:
         recorded_file = self.make_safe_unique_file(self.recorded_root / initial_name)
 
         if self.cfg.telegram_notify_recording_started:
-            self.notify(
-                "Grabación iniciada.\n"
-                f"Canal: {self.cfg.username}\n"
-                f"Calidad: {self.cfg.quality}\n"
-                f"Archivo: {recorded_file}"
+            self.notify_template(
+                "recording_started",
+                channel=self.cfg.username,
+                quality=self.cfg.quality,
+                recorded_file=recorded_file,
+                recorded_file_name=recorded_file.name,
             )
 
         streamlink_returncode = self.run_streamlink_live(recorded_file)
@@ -500,10 +685,11 @@ class TwitchRecorder:
 
         if not recorded_file.exists():
             logging.warning("La grabación terminó pero no existe el archivo: %s", recorded_file)
-            self.notify(
-                "La grabación terminó, pero no se encontró el archivo generado.\n"
-                f"Canal: {self.cfg.username}\n"
-                f"Archivo esperado: {recorded_file}",
+            self.notify_template(
+                "recording_missing_file",
+                channel=self.cfg.username,
+                recorded_file=recorded_file,
+                recorded_file_name=recorded_file.name,
                 errors_only=True,
             )
             return
@@ -513,19 +699,21 @@ class TwitchRecorder:
                 "streamlink terminó con código %s. Se intentará procesar el archivo existente.",
                 streamlink_returncode,
             )
-            self.notify(
-                "streamlink terminó con error, pero existe un archivo grabado.\n"
-                f"Canal: {self.cfg.username}\n"
-                f"Codigo: {streamlink_returncode}\n"
-                f"Archivo: {recorded_file}",
+            self.notify_template(
+                "streamlink_error",
+                channel=self.cfg.username,
+                returncode=streamlink_returncode,
+                recorded_file=recorded_file,
+                recorded_file_name=recorded_file.name,
                 errors_only=True,
             )
 
         if self.cfg.telegram_notify_recording_done:
-            self.notify(
-                "Grabación terminada.\n"
-                f"Canal: {self.cfg.username}\n"
-                f"Archivo: {recorded_file}"
+            self.notify_template(
+                "recording_done",
+                channel=self.cfg.username,
+                recorded_file=recorded_file,
+                recorded_file_name=recorded_file.name,
             )
 
         self.start_recording_processing(
@@ -592,11 +780,12 @@ class TwitchRecorder:
             )
         except Exception as exc:
             logging.exception("Error en procesamiento background: %s", exc)
-            self.notify(
-                "Error en procesamiento background.\n"
-                f"Canal: {self.cfg.username}\n"
-                f"Archivo: {recorded_file}\n"
-                f"Detalle: {exc}",
+            self.notify_template(
+                "background_processing_error",
+                channel=self.cfg.username,
+                recorded_file=recorded_file,
+                recorded_file_name=recorded_file.name,
+                details=exc,
                 errors_only=True,
             )
 
@@ -633,21 +822,23 @@ class TwitchRecorder:
             self.run_ffmpeg_fix(recorded_file, processed_file)
         except Exception as exc:
             logging.exception("No se pudo procesar video con ffmpeg: %s", exc)
-            self.notify(
-                "No se pudo procesar video con ffmpeg.\n"
-                f"Canal: {self.cfg.username}\n"
-                f"Archivo: {recorded_file}\n"
-                f"Detalle: {exc}",
+            self.notify_template(
+                "ffmpeg_error",
+                channel=self.cfg.username,
+                recorded_file=recorded_file,
+                recorded_file_name=recorded_file.name,
+                details=exc,
                 errors_only=True,
             )
             return
 
         logging.info("Video procesado: %s", processed_file)
         if self.cfg.telegram_notify_processed:
-            self.notify(
-                "Video procesado correctamente.\n"
-                f"Canal: {self.cfg.username}\n"
-                f"Archivo: {processed_file}"
+            self.notify_template(
+                "processed",
+                channel=self.cfg.username,
+                processed_file=processed_file,
+                processed_file_name=processed_file.name,
             )
         self.compress_processed_file(processed_file)
         self.archive_processed_file(processed_file)
@@ -789,20 +980,21 @@ class TwitchRecorder:
             stdout = (result.stdout or "").strip()
             details = stderr or stdout or f"codigo de salida {result.returncode}"
             logging.warning("No se pudo descargar el chat del VOD %s: %s", vod_id, details)
-            self.notify(
-                "No se pudo descargar el chat.\n"
-                f"VOD: {vod_id}\n"
-                f"Detalle: {details}",
+            self.notify_template(
+                "chat_download_error",
+                vod_id=vod_id,
+                details=details,
                 errors_only=True,
             )
             return
 
         logging.info("Chat descargado en: %s", chat_dir)
         if self.cfg.telegram_notify_post_tasks:
-            self.notify(
-                "Chat descargado correctamente.\n"
-                f"VOD: {vod_id}\n"
-                f"Carpeta: {chat_dir}"
+            self.notify_template(
+                "chat_downloaded",
+                vod_id=vod_id,
+                chat_dir=chat_dir,
+                chat_dir_name=chat_dir.name,
             )
 
     def download_vod(self, vod_id: str, final_name: str) -> None:
@@ -834,19 +1026,20 @@ class TwitchRecorder:
         result = subprocess.run(cmd, check=False)
         if result.returncode != 0:
             logging.warning("No se pudo descargar el VOD %s. Codigo: %s", vod_id, result.returncode)
-            self.notify(
-                "No se pudo descargar el VOD.\n"
-                f"VOD: {vod_id}\n"
-                f"Codigo: {result.returncode}",
+            self.notify_template(
+                "vod_download_error",
+                vod_id=vod_id,
+                returncode=result.returncode,
                 errors_only=True,
             )
             return
 
         if self.cfg.telegram_notify_post_tasks:
-            self.notify(
-                "VOD descargado correctamente.\n"
-                f"VOD: {vod_id}\n"
-                f"Archivo: {vod_target}"
+            self.notify_template(
+                "vod_downloaded",
+                vod_id=vod_id,
+                vod_target=vod_target,
+                vod_target_name=vod_target.name,
             )
 
     def now_local(self) -> datetime:
@@ -896,10 +1089,12 @@ class TwitchRecorder:
         )
 
         if self.cfg.telegram_notify_post_tasks:
-            self.notify(
-                "Compresión iniciada en background.\n"
-                f"Origen: {processed_file}\n"
-                f"Destino: {compressed_target}"
+            self.notify_template(
+                "compression_started",
+                processed_file=processed_file,
+                processed_file_name=processed_file.name,
+                compressed_target=compressed_target,
+                compressed_target_name=compressed_target.name,
             )
 
         if should_watch_compression:
@@ -920,17 +1115,19 @@ class TwitchRecorder:
         returncode = process.wait()
         if returncode == 0:
             if self.cfg.telegram_notify_post_tasks:
-                self.notify(
-                    "Compresión terminada correctamente.\n"
-                    f"Archivo: {compressed_target}"
+                self.notify_template(
+                    "compression_done",
+                    compressed_target=compressed_target,
+                    compressed_target_name=compressed_target.name,
                 )
             return
 
         logging.warning("HandBrake terminó con código %s. Log: %s", returncode, log_file)
-        self.notify(
-            "La compresión terminó con error.\n"
-            f"Codigo: {returncode}\n"
-            f"Log: {log_file}",
+        self.notify_template(
+            "compression_error",
+            returncode=returncode,
+            log_file=log_file,
+            log_file_name=log_file.name,
             errors_only=True,
         )
 
@@ -947,18 +1144,28 @@ class TwitchRecorder:
             shutil.move(str(processed_file), str(archive_target))
             logging.info("Archivo procesado movido a: %s", archive_target)
             if self.cfg.telegram_notify_post_tasks:
-                self.notify(
-                    "Archivo procesado movido.\n"
-                    f"Destino: {archive_target}"
+                self.notify_template(
+                    "archive_moved",
+                    channel=self.cfg.username,
+                    processed_file=processed_file,
+                    processed_file_name=processed_file.name,
+                    archive_target=archive_target,
+                    archive_target_name=archive_target.name,
+                    archive_public_url=self.cfg.archive_public_url,
                 )
             return
 
         shutil.copy2(processed_file, archive_target)
         logging.info("Archivo procesado copiado a: %s", archive_target)
         if self.cfg.telegram_notify_post_tasks:
-            self.notify(
-                "Archivo procesado copiado.\n"
-                f"Destino: {archive_target}"
+            self.notify_template(
+                "archive_copied",
+                channel=self.cfg.username,
+                processed_file=processed_file,
+                processed_file_name=processed_file.name,
+                archive_target=archive_target,
+                archive_target_name=archive_target.name,
+                archive_public_url=self.cfg.archive_public_url,
             )
 
     def start_post_stream_tasks(
@@ -1000,9 +1207,9 @@ class TwitchRecorder:
             )
         except Exception as exc:
             logging.warning("No se pudo obtener el ultimo VOD: %s", exc)
-            self.notify(
-                "No se pudo obtener el último VOD para tareas post-stream.\n"
-                f"Detalle: {exc}",
+            self.notify_template(
+                "post_stream_vod_error",
+                details=exc,
                 errors_only=True,
             )
             return
@@ -1010,14 +1217,14 @@ class TwitchRecorder:
         if not latest_vod:
             logging.warning("No se encontro VOD para tareas post-stream.")
             if self.cfg.telegram_notify_post_tasks:
-                self.notify("No se encontró VOD para tareas post-stream.")
+                self.notify_template("post_stream_vod_not_found")
             return
 
         vod_id = latest_vod.get("id")
         if not vod_id:
             logging.warning("El VOD obtenido no trae id. Se omiten tareas post-stream.")
-            self.notify(
-                "El VOD obtenido no trae id. Se omiten tareas post-stream.",
+            self.notify_template(
+                "post_stream_vod_missing_id",
                 errors_only=True,
             )
             return
@@ -1172,6 +1379,13 @@ def env_float(name: str, default: float) -> float:
     return float(value) if value is not None else default
 
 
+def resolve_project_path(value: str) -> Path:
+    path = Path(value).expanduser()
+    if path.is_absolute():
+        return path.resolve()
+    return (SCRIPT_DIR / path).resolve()
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="Graba directos de Twitch automáticamente."
@@ -1241,6 +1455,11 @@ def build_parser() -> argparse.ArgumentParser:
         "--archive-processed-mode",
         default=os.getenv("TWITCH_ARCHIVE_PROCESSED_MODE", "copy").strip().lower(),
         choices=["copy", "move"],
+    )
+    parser.add_argument(
+        "--archive-public-url",
+        default=os.getenv("TWITCH_ARCHIVE_PUBLIC_URL", ""),
+        help="URL pública opcional para usar en templates de archivado.",
     )
     parser.add_argument(
         "--make-stream-folder",
@@ -1323,6 +1542,14 @@ def build_parser() -> argparse.ArgumentParser:
         default=env_bool("TELEGRAM_NOTIFY_ERRORS", True),
     )
     parser.add_argument(
+        "--telegram-templates-path",
+        default=os.getenv(
+            "TELEGRAM_TEMPLATES_PATH",
+            str(DEFAULT_TELEGRAM_TEMPLATES_PATH),
+        ),
+        help="Carpeta con templates .txt para mensajes de Telegram.",
+    )
+    parser.add_argument(
         "--log-level",
         default=os.getenv("LOG_LEVEL", "INFO"),
         choices=["DEBUG", "INFO", "WARNING", "ERROR"],
@@ -1363,6 +1590,7 @@ def build_config(args: argparse.Namespace) -> Config:
             else None
         ),
         archive_processed_mode=args.archive_processed_mode,
+        archive_public_url=args.archive_public_url,
         make_stream_folder=args.make_stream_folder,
         short_folder=args.short_folder,
         hls_segments_live=args.hls_segments_live,
@@ -1385,6 +1613,11 @@ def build_config(args: argparse.Namespace) -> Config:
         telegram_notify_processed=args.telegram_notify_processed,
         telegram_notify_post_tasks=args.telegram_notify_post_tasks,
         telegram_notify_errors=args.telegram_notify_errors,
+        telegram_templates_path=(
+            resolve_project_path(args.telegram_templates_path)
+            if args.telegram_templates_path
+            else None
+        ),
         log_level=args.log_level,
     )
 
@@ -1415,11 +1648,12 @@ def main() -> int:
     except Exception as exc:
         logging.exception("Error fatal: %s", exc)
         if cfg and cfg.telegram_notify_errors:
-            TelegramNotifier(cfg).send_sync(
-                "Error fatal en Kala Stream Downloader.\n"
-                f"Canal: {cfg.username}\n"
-                f"Detalle: {exc}"
+            message = TelegramTemplateRenderer(cfg.telegram_templates_path).render(
+                "fatal_error",
+                channel=cfg.username,
+                details=exc,
             )
+            TelegramNotifier(cfg).send_sync(message)
         return 1
 
 

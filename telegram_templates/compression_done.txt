@@ -1,0 +1,3 @@
+✅ Video comprimido correctamente.
+Ya está listo para publicar o archivar.
+Archivo: {compressed_target_name}

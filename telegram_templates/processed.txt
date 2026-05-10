@@ -1,0 +1,3 @@
+Video procesado correctamente.
+Canal: {channel}
+Archivo: {processed_file}

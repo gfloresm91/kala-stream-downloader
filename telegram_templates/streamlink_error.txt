@@ -1,0 +1,4 @@
+streamlink terminó con error, pero existe un archivo grabado.
+Canal: {channel}
+Codigo: {returncode}
+Archivo: {recorded_file}

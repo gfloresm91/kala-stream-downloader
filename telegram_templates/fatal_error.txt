@@ -1,0 +1,3 @@
+Error fatal en Kala Stream Downloader.
+Canal: {channel}
+Detalle: {details}

@@ -1,0 +1,4 @@
+Grabación iniciada.
+Canal: {channel}
+Calidad: {quality}
+Archivo: {recorded_file}

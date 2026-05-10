@@ -1,0 +1,5 @@
+Stream detectado en vivo.
+Canal: {channel}
+Titulo: {stream_title}
+Juego: {game_name}
+Calidad: {quality}

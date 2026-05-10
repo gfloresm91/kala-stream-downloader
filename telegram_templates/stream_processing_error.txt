@@ -1,0 +1,3 @@
+Error procesando stream.
+Canal: {channel}
+Detalle: {details}

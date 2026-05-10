@@ -1,0 +1,4 @@
+Error en procesamiento background.
+Canal: {channel}
+Archivo: {recorded_file}
+Detalle: {details}
